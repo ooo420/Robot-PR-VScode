@@ -50,11 +50,11 @@ RATIO_REDUCTEUR = 50.0
 RESOLUTION_T_DEG = 360.0 / (PAS_PAR_TOUR_MOTEUR_T * MICROPAS_T * RATIO_REDUCTEUR)  # degrés par micro-pas
  
 # ---------------------------------------------------------------------------
-# Positions du cycle pick-and-place (cf. Tableau 39 du rapport)
+# Positions du cycle pick-and-place 
 # ---------------------------------------------------------------------------
  
-POSITION_PICK = {"theta_deg": 30.0, "z_mm": 200.0}
-POSITION_PLACE = {"theta_deg": 45.0, "z_mm": 190.0}
+POSITION_PICK = {"theta_deg": 0.0, "z_mm": 200.0}
+POSITION_PLACE = {"theta_deg": 45.0, "z_mm": 178.0}
 POSITION_HOME = {"theta_deg": 0.0, "z_mm": 370.0}
  
 # ---------------------------------------------------------------------------
