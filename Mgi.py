@@ -1,85 +1,158 @@
 """
 mgi.py
-Implémente le Modèle Géométrique Inverse (MGI) et Direct (MGD) du robot
-PR (Pivot + translation), conformément à la dérivation DH du rapport
-(§2.5.2 - 2.5.3) :
 
-    x = L1 + L2·cos(θ)
-    z = q1 + L2·sin(θ)
-
-où L1 (config.LONGUEUR_L1_MM) est l'offset fixe de la base (bras 1,
-prismatique) et L2 (config.LONGUEUR_BRAS_MM) la longueur du bras 2
-(rotation theta).
+Contient les fonctions de cinématique du robot PR :
+- MGD : coordonnées articulaires -> coordonnées cartésiennes
+- MGI : coordonnées cartésiennes -> coordonnées articulaires
+- correction de position à partir de la vision
 """
 
 import math
 import config
 
 
+# ============================================================
+# EXCEPTION
+# ============================================================
+
 class PositionInaccessibleError(Exception):
-    """Levée quand la position cartésienne demandée est hors d'atteinte
-    du bras (condition de portée non respectée) ou hors de la plage de
-    course de l'axe Z."""
+    """Levée lorsqu'une position demandée est inaccessible."""
+    pass
 
 
-def mgd(q1_mm: float, theta_deg: float):
+# ============================================================
+# MGD
+# ============================================================
+
+def mgd(q1_mm, theta_deg):
     """
-    Modèle Géométrique Direct : retourne la position cartésienne (x, z)
-    de l'effecteur à partir de la consigne articulaire (q1, theta).
+    Modèle géométrique direct.
+
+    Entrées :
+        q1_mm    : position de l'axe prismatique [mm]
+        theta_deg: angle de rotation [deg]
+
+    Sorties :
+        x_mm     : position cartésienne X [mm]
+        z_mm     : position cartésienne Z [mm]
     """
+
+    # Récupération des dimensions
     L1 = config.LONGUEUR_L1_MM
     L2 = config.LONGUEUR_BRAS_MM
+
+    # Conversion degrés -> radians
     theta_rad = math.radians(theta_deg)
 
+    # Calcul de la position cartésienne
     x_mm = L1 + L2 * math.cos(theta_rad)
     z_mm = q1_mm + L2 * math.sin(theta_rad)
+
     return x_mm, z_mm
 
 
-def mgi(x_mm: float, z_mm: float):
-    """
-    Modèle Géométrique Inverse : calcule la consigne articulaire
-    (q1, theta) à partir des coordonnées cartésiennes (x, z) désirées.
+# ============================================================
+# MGI
+# ============================================================
 
-    Condition de portée : (x-L1)² + (z-q1)² = L2²
-        => q1 = z ± sqrt(L2² - (x-L1)²)
-        => theta = atan2(z - q1, x - L1)
-
-    Le signe ± correspond aux deux configurations possibles du bras ;
-    on retient celle qui respecte la plage de course de l'axe Z
-    (config.Q1_MIN_MM <= q1 <= config.Q1_MAX_MM).
+def mgi(x_mm, z_mm):
     """
+    Modèle géométrique inverse.
+
+    Entrées :
+        x_mm : position cartésienne X [mm]
+        z_mm : position cartésienne Z [mm]
+
+    Sorties :
+        q1_mm     : position de l'axe Z [mm]
+        theta_deg : angle de rotation [deg]
+    """
+
     L1 = config.LONGUEUR_L1_MM
     L2 = config.LONGUEUR_BRAS_MM
 
+    # Distance horizontale entre L1 et la position demandée
     dx = x_mm - L1
-    discriminant = L2 ** 2 - dx ** 2
+
+    # Équation géométrique :
+    # dx² + (z-q1)² = L2²
+    discriminant = L2**2 - dx**2
+
+    # Vérification de l'accessibilité
     if discriminant < 0:
         raise PositionInaccessibleError(
-            f"x={x_mm} mm hors de portée du bras (L1={L1} mm, L2={L2} mm)."
+            f"Position inaccessible : X={x_mm:.2f} mm, "
+            f"Z={z_mm:.2f} mm"
         )
+
+    # Deux configurations géométriques possibles
     racine = math.sqrt(discriminant)
 
-    for q1_candidat in (z_mm - racine, z_mm + racine):
-        if config.Q1_MIN_MM <= q1_candidat <= config.Q1_MAX_MM:
-            theta_rad = math.atan2(z_mm - q1_candidat, dx)
-            return q1_candidat, math.degrees(theta_rad)
+    q1_candidats = (
+        z_mm - racine,
+        z_mm + racine
+    )
 
+    # Recherche d'une solution respectant les limites
+    for q1_candidat in q1_candidats:
+
+        if (
+            config.Q1_MIN_MM
+            <= q1_candidat
+            <= config.Q1_MAX_MM
+        ):
+
+            theta_rad = math.atan2(
+                z_mm - q1_candidat,
+                dx
+            )
+
+            theta_deg = math.degrees(theta_rad)
+
+            # Vérification de l'angle
+            if -90.0 <= theta_deg <= 90.0:
+                return q1_candidat, theta_deg
+
+    # Aucune solution valide
     raise PositionInaccessibleError(
-        f"Aucune solution MGI pour (x={x_mm}, z={z_mm}) mm ne respecte "
-        f"la course de l'axe Z [{config.Q1_MIN_MM}, {config.Q1_MAX_MM}] mm."
+        f"Aucune configuration valide pour "
+        f"X={x_mm:.2f} mm, Z={z_mm:.2f} mm"
     )
 
 
-def appliquer_correction(theta_actuel_deg: float, z_actuel_mm: float,
-                          dx_mm: float, dz_mm: float):
+# ============================================================
+# CORRECTION PAR VISION
+# ============================================================
+
+def appliquer_correction(
+    theta_actuel_deg,
+    z_actuel_mm,
+    dx_mm,
+    dz_mm
+):
     """
-    Recalcule la consigne (q1, theta) corrigée à partir de l'offset
-    visuel (dx, dz) mesuré par vision.py, lorsque celui-ci dépasse le
-    seuil de tolérance (config.SEUIL_OFFSET_MM). L'offset est ajouté à
-    la position cartésienne courante avant de repasser par le MGI.
+    Applique la correction provenant du système de vision.
+
+    Étapes :
+        1. Calcul de la position cartésienne actuelle avec MGD
+        2. Ajout des offsets détectés par la caméra
+        3. Calcul des nouvelles coordonnées articulaires avec MGI
     """
-    x_actuel_mm, _ = mgd(z_actuel_mm, theta_actuel_deg)
-    x_corrige = x_actuel_mm + dx_mm
-    z_corrige = z_actuel_mm + dz_mm
-    return mgi(x_corrige, z_corrige)
+
+    # Position cartésienne actuelle
+    x_actuel, z_cartesien = mgd(
+        z_actuel_mm,
+        theta_actuel_deg
+    )
+
+    # Correction demandée par la vision
+    x_corrige = x_actuel + dx_mm
+    z_corrige = z_cartesien + dz_mm
+
+    # Retour dans l'espace articulaire
+    q1_corrige, theta_corrige = mgi(
+        x_corrige,
+        z_corrige
+    )
+
+    return theta_corrige, q1_corrige
