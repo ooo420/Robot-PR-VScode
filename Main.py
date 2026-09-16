@@ -17,6 +17,7 @@ ALARM
 
 import time
 import pigpio
+import math
 
 import config
 from motor_control import creer_axes, LimiteCourseError
