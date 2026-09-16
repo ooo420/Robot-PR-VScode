@@ -1,158 +1,505 @@
 """
-mgi.py
+main.py
 
-Contient les fonctions de cinématique du robot PR :
-- MGD : coordonnées articulaires -> coordonnées cartésiennes
-- MGI : coordonnées cartésiennes -> coordonnées articulaires
-- correction de position à partir de la vision
+Programme principal du robot PR.
+
+Gère la machine à états :
+INIT
+HOMING
+WAIT_START
+PICK
+VACUUM
+PLACE
+RELEASE
+RETURN
+ALARM
 """
 
-import math
+import time
+import pigpio
+
 import config
+from motor_control import creer_axes, LimiteCourseError
+from pneumatic import SystemePneumatique, DepressionError
+from vision import VisionSystem
+from mgi import appliquer_correction
 
 
 # ============================================================
-# EXCEPTION
+# CENTRE THEORIQUE CAMERA
 # ============================================================
 
-class PositionInaccessibleError(Exception):
-    """Levée lorsqu'une position demandée est inaccessible."""
-    pass
-
-
-# ============================================================
-# MGD
-# ============================================================
-
-def mgd(q1_mm, theta_deg):
-    """
-    Modèle géométrique direct.
-
-    Entrées :
-        q1_mm    : position de l'axe prismatique [mm]
-        theta_deg: angle de rotation [deg]
-
-    Sorties :
-        x_mm     : position cartésienne X [mm]
-        z_mm     : position cartésienne Z [mm]
-    """
-
-    # Récupération des dimensions
-    L1 = config.LONGUEUR_L1_MM
-    L2 = config.LONGUEUR_BRAS_MM
-
-    # Conversion degrés -> radians
-    theta_rad = math.radians(theta_deg)
-
-    # Calcul de la position cartésienne
-    x_mm = L1 + L2 * math.cos(theta_rad)
-    z_mm = q1_mm + L2 * math.sin(theta_rad)
-
-    return x_mm, z_mm
+CENTRE_THEORIQUE_PX = (
+    config.RESOLUTION_CAMERA[0] / 2,
+    config.RESOLUTION_CAMERA[1] / 2
+)
 
 
 # ============================================================
-# MGI
+# ETATS
 # ============================================================
 
-def mgi(x_mm, z_mm):
-    """
-    Modèle géométrique inverse.
+ETATS = [
+    "INIT",
+    "HOMING",
+    "WAIT_START",
+    "PICK",
+    "VACUUM",
+    "PLACE",
+    "RELEASE",
+    "RETURN",
+    "ALARM"
+]
 
-    Entrées :
-        x_mm : position cartésienne X [mm]
-        z_mm : position cartésienne Z [mm]
 
-    Sorties :
-        q1_mm     : position de l'axe Z [mm]
-        theta_deg : angle de rotation [deg]
-    """
+# ============================================================
+# ROBOT PR
+# ============================================================
 
-    L1 = config.LONGUEUR_L1_MM
-    L2 = config.LONGUEUR_BRAS_MM
+class RobotPR:
 
-    # Distance horizontale entre L1 et la position demandée
-    dx = x_mm - L1
+    def __init__(self):
 
-    # Équation géométrique :
-    # dx² + (z-q1)² = L2²
-    discriminant = L2**2 - dx**2
+        # Connexion au démon pigpio
+        self.pi = pigpio.pi()
 
-    # Vérification de l'accessibilité
-    if discriminant < 0:
-        raise PositionInaccessibleError(
-            f"Position inaccessible : X={x_mm:.2f} mm, "
-            f"Z={z_mm:.2f} mm"
-        )
+        if not self.pi.connected:
 
-    # Deux configurations géométriques possibles
-    racine = math.sqrt(discriminant)
-
-    q1_candidats = (
-        z_mm - racine,
-        z_mm + racine
-    )
-
-    # Recherche d'une solution respectant les limites
-    for q1_candidat in q1_candidats:
-
-        if (
-            config.Q1_MIN_MM
-            <= q1_candidat
-            <= config.Q1_MAX_MM
-        ):
-
-            theta_rad = math.atan2(
-                z_mm - q1_candidat,
-                dx
+            raise RuntimeError(
+                "Impossible de se connecter "
+                "à pigpio."
             )
 
-            theta_deg = math.degrees(theta_rad)
+        # Création des axes
+        self.axe_z, self.axe_theta = (
+            creer_axes(self.pi)
+        )
 
-            # Vérification de l'angle
-            if -90.0 <= theta_deg <= 90.0:
-                return q1_candidat, theta_deg
+        # Système pneumatique
+        self.pneumatique = (
+            SystemePneumatique(self.pi)
+        )
 
-    # Aucune solution valide
-    raise PositionInaccessibleError(
-        f"Aucune configuration valide pour "
-        f"X={x_mm:.2f} mm, Z={z_mm:.2f} mm"
-    )
+        # Système de vision
+        self.vision = VisionSystem()
+
+        # Bouton départ
+        self.pi.set_mode(
+            config.PIN_BOUTON_DEPART,
+            pigpio.INPUT
+        )
+
+        self.pi.set_pull_up_down(
+            config.PIN_BOUTON_DEPART,
+            pigpio.PUD_UP
+        )
+
+        # LED alarme
+        self.pi.set_mode(
+            config.PIN_LED_ALARME,
+            pigpio.OUTPUT
+        )
+
+        # Bouton acquittement
+        self.pi.set_mode(
+            config.PIN_BOUTON_ACQUITTEMENT,
+            pigpio.INPUT
+        )
+
+        self.pi.set_pull_up_down(
+            config.PIN_BOUTON_ACQUITTEMENT,
+            pigpio.PUD_UP
+        )
+
+        # Etat initial
+        self.etat = "INIT"
+
+        # Temps de cycle
+        self.debut_cycle = None
+
+
+    # ========================================================
+    # BOUCLE PRINCIPALE
+    # ========================================================
+
+    def run(self):
+
+        while True:
+
+            try:
+
+                if self.etat == "INIT":
+                    self._etat_init()
+
+                elif self.etat == "HOMING":
+                    self._etat_homing()
+
+                elif self.etat == "WAIT_START":
+                    self._etat_wait_start()
+
+                elif self.etat == "PICK":
+                    self._etat_pick()
+
+                elif self.etat == "VACUUM":
+                    self._etat_vacuum()
+
+                elif self.etat == "PLACE":
+                    self._etat_place()
+
+                elif self.etat == "RELEASE":
+                    self._etat_release()
+
+                elif self.etat == "RETURN":
+                    self._etat_return()
+
+                elif self.etat == "ALARM":
+                    self._etat_alarm()
+
+            except (
+                LimiteCourseError,
+                DepressionError
+            ) as erreur:
+
+                print(
+                    f"[ALARME] {erreur}"
+                )
+
+                self.etat = "ALARM"
+
+
+    # ========================================================
+    # INIT
+    # ========================================================
+
+    def _etat_init(self):
+
+        print("[ETAT] INIT")
+
+        # LED éteinte
+        self.pi.write(
+            config.PIN_LED_ALARME,
+            0
+        )
+
+        # Désactivation moteurs
+        self.axe_z.enable(False)
+        self.axe_theta.enable(False)
+
+        # Passage au homing
+        self.etat = "HOMING"
+
+
+    # ========================================================
+    # HOMING
+    # ========================================================
+
+    def _etat_homing(self):
+
+        print("[ETAT] HOMING")
+
+        # Référencement axe Z
+        self.axe_z.homing()
+
+        # Référencement axe theta
+        self.axe_theta.homing()
+
+        print(
+            "[HOMING] Référencement terminé."
+        )
+
+        self.etat = "WAIT_START"
+
+
+    # ========================================================
+    # ATTENTE DEPART
+    # ========================================================
+
+    def _etat_wait_start(self):
+
+        print(
+            "[ETAT] WAIT_START"
+        )
+
+        print(
+            "En attente du bouton START..."
+        )
+
+        while (
+            self.pi.read(
+                config.PIN_BOUTON_DEPART
+            ) != 0
+        ):
+
+            time.sleep(0.01)
+
+        self.debut_cycle = time.time()
+
+        print(
+            "[SYSTEME] Cycle démarré."
+        )
+
+        self.etat = "PICK"
+
+
+    # ========================================================
+    # PICK
+    # ========================================================
+
+    def _etat_pick(self):
+
+        print("[ETAT] PICK")
+
+        position = config.POSITION_PICK
+
+        # Rotation vers la position de prise
+        self.axe_theta.aller_a(
+            position["theta_deg"]
+        )
+
+        # Descente vers le LCD
+        self.axe_z.aller_a(
+            position["z_mm"]
+        )
+
+        self.etat = "VACUUM"
+
+
+    # ========================================================
+    # VACUUM
+    # ========================================================
+
+    def _etat_vacuum(self):
+
+        print("[ETAT] VACUUM")
+
+        # Activation + vérification
+        self.pneumatique.prise_avec_verification()
+
+        self.etat = "PLACE"
+
+
+    # ========================================================
+    # PLACE
+    # ========================================================
+
+    def _etat_place(self):
+
+        print("[ETAT] PLACE")
+
+        position = config.POSITION_PLACE
+
+        # Position théorique de dépose
+        self.axe_theta.aller_a(
+            position["theta_deg"]
+        )
+
+        self.axe_z.aller_a(
+            position["z_mm"]
+        )
+
+        # Capture image
+        image = self.vision.capturer_image()
+
+        # Calcul offset
+        offset = (
+            self.vision.calculer_offset_mm(
+                image
+            )
+        )
+
+        # ----------------------------------------------------
+        # Cas où la vision détecte le logement
+        # ----------------------------------------------------
+
+        if offset is not None:
+
+            dx_mm, dz_mm = offset
+
+            if self.vision.offset_depasse_seuil(
+                dx_mm,
+                dz_mm
+            ):
+
+                print(
+                    "[VISION] "
+                    "Correction nécessaire."
+                )
+
+                # Correction par MGD + MGI
+                theta_corrige, z_corrige = (
+                    appliquer_correction(
+                        self.axe_theta.position,
+                        self.axe_z.position,
+                        dx_mm,
+                        dz_mm
+                    )
+                )
+
+                # Déplacement corrigé
+                self.axe_theta.aller_a(
+                    theta_corrige
+                )
+
+                self.axe_z.aller_a(
+                    z_corrige
+                )
+
+            else:
+
+                print(
+                    "[VISION] "
+                    "Offset inférieur au seuil."
+                )
+
+        else:
+
+            print(
+                "[VISION] "
+                "Pas de correction appliquée."
+            )
+
+        self.etat = "RELEASE"
+
+
+    # ========================================================
+    # RELEASE
+    # ========================================================
+
+    def _etat_release(self):
+
+        print("[ETAT] RELEASE")
+
+        # Arrêt du vide
+        self.pneumatique.relacher()
+
+        # Petit délai pour assurer le relâchement
+        time.sleep(0.2)
+
+        self.etat = "RETURN"
+
+
+    # ========================================================
+    # RETOUR HOME
+    # ========================================================
+
+    def _etat_return(self):
+
+        print("[ETAT] RETURN")
+
+        position = config.POSITION_HOME
+
+        # Retour angle 0°
+        self.axe_theta.aller_a(
+            position["theta_deg"]
+        )
+
+        # Remontée
+        self.axe_z.aller_a(
+            position["z_mm"]
+        )
+
+        # Calcul durée cycle
+        if self.debut_cycle is not None:
+
+            duree = (
+                time.time()
+                - self.debut_cycle
+            )
+
+            print(
+                f"[CYCLE] Durée = "
+                f"{duree:.2f} s"
+            )
+
+            if duree <= config.CYCLE_MAX_S:
+
+                print(
+                    "[CYCLE] "
+                    "Objectif respecté."
+                )
+
+            else:
+
+                print(
+                    "[CYCLE] "
+                    "Objectif dépassé."
+                )
+
+        self.etat = "WAIT_START"
+
+
+    # ========================================================
+    # ALARME
+    # ========================================================
+
+    def _etat_alarm(self):
+
+        print("[ETAT] ALARM")
+
+        # Arrêt moteurs
+        self.axe_z.enable(False)
+        self.axe_theta.enable(False)
+
+        # Arrêt pneumatique
+        self.pneumatique.desactiver_vanne()
+
+        # Allumage LED
+        self.pi.write(
+            config.PIN_LED_ALARME,
+            1
+        )
+
+        print(
+            "Appuyer sur le bouton "
+            "d'acquittement..."
+        )
+
+        while (
+            self.pi.read(
+                config.PIN_BOUTON_ACQUITTEMENT
+            ) != 0
+        ):
+
+            time.sleep(0.01)
+
+        # Extinction LED
+        self.pi.write(
+            config.PIN_LED_ALARME,
+            0
+        )
+
+        self.etat = "INIT"
 
 
 # ============================================================
-# CORRECTION PAR VISION
+# PROGRAMME PRINCIPAL
 # ============================================================
 
-def appliquer_correction(
-    theta_actuel_deg,
-    z_actuel_mm,
-    dx_mm,
-    dz_mm
-):
-    """
-    Applique la correction provenant du système de vision.
+if __name__ == "__main__":
 
-    Étapes :
-        1. Calcul de la position cartésienne actuelle avec MGD
-        2. Ajout des offsets détectés par la caméra
-        3. Calcul des nouvelles coordonnées articulaires avec MGI
-    """
+    robot = RobotPR()
 
-    # Position cartésienne actuelle
-    x_actuel, z_cartesien = mgd(
-        z_actuel_mm,
-        theta_actuel_deg
-    )
+    try:
 
-    # Correction demandée par la vision
-    x_corrige = x_actuel + dx_mm
-    z_corrige = z_cartesien + dz_mm
+        robot.run()
 
-    # Retour dans l'espace articulaire
-    q1_corrige, theta_corrige = mgi(
-        x_corrige,
-        z_corrige
-    )
+    except KeyboardInterrupt:
 
-    return theta_corrige, q1_corrige
+        print(
+            "\nArrêt demandé par l'utilisateur."
+        )
+
+    finally:
+
+        robot.pneumatique.desactiver_vanne()
+
+        robot.axe_z.enable(False)
+        robot.axe_theta.enable(False)
+
+        robot.vision.fermer()
+
+        robot.pi.stop()
+
+        print(
+            "Système arrêté proprement."
+        )
