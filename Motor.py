@@ -12,6 +12,7 @@ Gestion des moteurs pas-à-pas :
 """
 
 import time
+import math
 import pigpio
 import config
 
